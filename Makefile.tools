@@ -365,6 +365,14 @@ tools_mesh_cfgtest_LDADD = lib/libbluetooth-internal.la src/libshared-ell.la \
 						$(ell_ldadd)
 endif
 
+bin_PROGRAMS +=  tools/iplink-tool
+
+tools_iplink_tool_SOURCES = tools/iplink-tool.c \
+				mesh/crypto.h mesh/crypto.c
+
+tools_iplink_tool_LDADD = lib/libbluetooth-internal.la src/libshared-ell.la \
+						$(ell_ldadd) -lreadline
+
 EXTRA_DIST += tools/mesh-gatt/local_node.json tools/mesh-gatt/prov_db.json
 
 if DEPRECATED
