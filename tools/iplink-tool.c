@@ -83,15 +83,21 @@ struct hcidev {
 
 struct net_key {
 	uint32_t id;
+	uint32_t seq;
 	uint8_t n_key[16];
 	uint8_t enc_key[16];
 	uint8_t priv_key[16];
 };
 
+struct peer_rpl {
+	uint32_t key_id;
+	uint32_t seq;
+};
+
 struct ipl_node {
 	uint64_t addr_64;
+	struct l_queue *rpl;
 	bool connected;
-	uint32_t seq;
 	uint16_t addr_16;
 	bdaddr_t irpa_long;
 	bdaddr_t irpa_short;
@@ -851,9 +857,6 @@ static void send_data(void *user_data)
 	socklen_t sk_len = sizeof(sk_err);
 	size_t sent_len;
 
-	/* Increment local sequence number */
-	local->node.seq++;
-
 	if (local->io)
 		sk = l_io_get_fd(local->io);
 	else
@@ -1093,6 +1096,9 @@ static bool generate_pdu(uint8_t *out, struct net_key *key,
 	*total_len = len + pdu->payload_len + 8;
 	print_data("encrypted PDU", 0, out, *total_len);
 
+	/* Increment local sequence number */
+	pdu->seq = key->seq++;
+
 	return true;
 }
 
@@ -1120,8 +1126,6 @@ static bool ack_reply(uint8_t fctl, struct net_key *key, uint8_t fid,
 
 	offset = 6;
 
-	pdu.seq = local->node.seq;
-
 	if (!generate_pdu(send_buf + offset, key, peer, is_short, &pdu,
 								&total_len)) {
 		print("Failed to generate ACK response");
@@ -1135,6 +1139,37 @@ static bool ack_reply(uint8_t fctl, struct net_key *key, uint8_t fid,
 	iov->iov_len = total_len + offset;
 
 	l_idle_oneshot(send_data, iov, l_free);
+
+	return true;
+}
+
+static bool check_rpl(struct ipl_node *peer, uint32_t key_id, uint32_t seq)
+{
+	const struct l_queue_entry *entry;
+	struct peer_rpl *rpl;
+
+	entry = l_queue_get_entries(peers->rpl);
+
+	for (; entry; entry = entry->next) {
+		rpl = entry->data;
+
+		if (rpl->key_id != key_id)
+			continue;
+
+		if (seq <= rpl->seq) {
+			print("Fail RPL check: old %u, new %u", rpl->seq, seq);
+			return false;
+		}
+
+		rpl->seq = seq;
+		return true;
+	}
+
+	rpl = l_new(struct peer_rpl, 1);
+	rpl->key_id = key_id;
+	rpl->seq = seq;
+
+	l_queue_push_tail(peer->rpl, rpl);
 
 	return true;
 }
@@ -1201,13 +1236,8 @@ try_again:
 		return;
 	}
 
-	if (pdu.seq && pdu.seq < peer->seq) {
-		print("Invalid Seq #: %u (current peer Seq # %u)",
-							pdu.seq, peer->seq);
+	if (pdu.seq && !check_rpl(peer, key->id, pdu.seq))
 		return;
-	}
-
-	peer->seq = pdu.seq;
 
 	pdu.payload = buf + hdr_sz;
 	pdu.payload_len = len - hdr_sz - 8;
@@ -1720,14 +1750,8 @@ static void cmd_send_data(int argc, char **argv)
 	}
 
 	if (IPLINK_AR(pdu.fctl) || IPLINK_OP(pdu.fctl)) {
-		if (argc <= next_arg) {
-			pdu.fid = (uint8_t) (local->node.seq & 0xff);
-			print("Frame ID value to be present, using %2.2x",
-								pdu.fid);
-		} else {
-			sscanf(argv[next_arg], "%2x", &val);
-			pdu.fid = (uint8_t) val;
-		}
+		pdu.fid = (uint8_t) (key->seq & 0xff);
+		print("Frame ID value set to %2.2x", pdu.fid);
 	}
 
 	/* Use canned data */
@@ -1743,8 +1767,6 @@ static void cmd_send_data(int argc, char **argv)
 		memcpy(send_buf, &peer->irpa_long.b, 6);
 
 	offset = 6;
-
-	pdu.seq = local->node.seq;
 
 	if (!generate_pdu(send_buf + offset, key, peer, is_short, &pdu,
 								&pdu_len))
@@ -1806,6 +1828,8 @@ static void cmd_add_peer(int argc, char **argv)
 
 	memcpy(peers[num_peers].ark_short, ark, 16);
 	l_free(ark);
+
+	peers[num_peers].rpl = l_queue_new();
 
 	num_peers++;
 	load_arks();
@@ -1938,9 +1962,10 @@ done:
 static void save_to_file(const char *path)
 {
 	struct l_settings *settings;
+	char **groups = NULL;
 	char *data;
 	size_t length = 0;
-	int i;
+	int i, k;
 
 	printf("Saving updated info to %s\n", path);
 
@@ -1951,18 +1976,46 @@ static void save_to_file(const char *path)
 		goto done;
 	}
 
-	if (!l_settings_set_uint(settings, "Local", "SeqNum", local->node.seq))
-		printf("Failed to save local Seq #\n");
+	groups = l_settings_get_groups(settings);
+
+	for(i = 0; groups[i]; i++) {
+		uint32_t id;
+
+		if (strncmp(groups[i], "Network", 7))
+			continue;
+
+		sscanf(groups[i] + 7, "%d", &id);
+
+		k = find_key_by_keyid_32(id);
+		if (k < 0) {
+			//TODO: add a new NetKey
+			continue;
+		}
+
+		if (!l_settings_set_uint(settings, groups[i], "SeqNum",
+								keys[k].seq))
+			print("Failed to save local Seq # for %s", groups[i]);
+	}
+
 
 	for (i = 0; i < num_peers; i++) {
 		char name[10];
+		char buf[16];
+		const struct l_queue_entry *entry;
 
 		sprintf(name, "Peer%d", i);
 
-		if (!l_settings_set_uint(settings, name, "SeqNum",
-					 peers[i].seq)) {
-			printf("Failed to save %s's Seq #\n", name);
-			continue;
+		entry = l_queue_get_entries(peers[i].rpl);
+
+		for (; entry; entry = entry->next) {
+			struct peer_rpl *rpl = entry->data;
+
+			sprintf(buf, "SeqNum%d", rpl->key_id);
+			if (!l_settings_set_uint(settings, name, buf,
+					rpl->seq)) {
+				printf("Failed to save %s's Seq #\n", name);
+				continue;
+			}
 		}
 	}
 
@@ -1982,7 +2035,6 @@ static bool setup_from_file(const char *path)
 	int i, k;
 	bool result = false;
 	char **groups = NULL;
-	char **keywords = NULL;
 
 	settings = l_settings_new();
 	if(!l_settings_load_from_file(settings, path)) {
@@ -1990,32 +2042,34 @@ static bool setup_from_file(const char *path)
 		goto done;
 	}
 
-	buf = l_settings_get_bytes(settings, "Keys", "Address", &n);
-	if (!buf || n != sizeof(address_key)) {
-		print("Failed to read address key from %s", path);
-		goto done;
-	}
 
-	memcpy(address_key, buf, sizeof(address_key));
-	l_free(buf);
+	groups = l_settings_get_groups(settings);
 
-	keywords = l_settings_get_keys(settings, "Keys");
+	for(i = 0, k = 0; groups[i] && k < MAX_KEYS; i++) {
 
-	for(i = 0, k = 0; keywords[i] && k < MAX_KEYS; i++) {
-
-		if (strncmp(keywords[i], "Network", 7))
+		if (strncmp(groups[i], "Network", 7))
 			continue;
 
-		sscanf(keywords[i] + 7, "%d", &keys[k + 1].id);
+		sscanf(groups[i] + 7, "%d", &keys[k + 1].id);
 
-		buf = l_settings_get_bytes(settings, "Keys", keywords[i], &n);
+		buf = l_settings_get_bytes(settings, groups[i], "Key", &n);
 		if (!buf || n != 16) {
-			l_error("Failed to read network key from %s\n", path);
+			l_error("Failed to read network key for %s\n",
+								groups[i]);
 			continue;
 		}
 
 		memcpy(&keys[k].n_key, buf, 16);
 		l_free(buf);
+
+		if (!l_settings_get_uint(settings, groups[i], "SeqNum",
+							&keys[k].seq)) {
+			print("Failed to read local sequence number for %s",
+								groups[i]);
+			print("Re-initializing to zero");
+			keys[k].seq = 0;
+		}
+
 		k++;
 	}
 
@@ -2028,11 +2082,14 @@ static bool setup_from_file(const char *path)
 	default_temp_key = &keys[0];
 
 	/* Local Node */
-	if (!l_settings_get_uint(settings, "Local", "SeqNum",
-							&local->node.seq)) {
-		print("Failed to read local sequence number from %s", path);
+	buf = l_settings_get_bytes(settings, "Local", "AddressKey", &n);
+	if (!buf || n != sizeof(address_key)) {
+		print("Failed to read address key from %s", path);
 		goto done;
 	}
+
+	memcpy(address_key, buf, sizeof(address_key));
+	l_free(buf);
 
 	if (!l_settings_get_uint(settings, "Local", "ShortAddress", &val)) {
 		print("Failed to read local short address from %s\n", path);
@@ -2048,7 +2105,6 @@ static bool setup_from_file(const char *path)
 	}
 
 	/* Peers */
-	groups = l_settings_get_groups(settings);
 
 	for(i = 0, k = 0; groups[i] && k < MAX_PEERS; i++) {
 		char *str;
@@ -2326,7 +2382,7 @@ static const struct bt_shell_menu main_menu = {
 		cmd_add_peer,	"Add peer info"},
 	{ "connect",		"<addr16|addr64>",
 		cmd_connect,	"Connect to a remote device"},
-	{ "send-data",		"<addr> <fctl> [keyid] [fid]",
+	{ "send-data",		"<addr> <fctl> [keyid]",
 		cmd_send_data,	"Send canned data"},
 	{ "power-off",		NULL,
 		cmd_power_off,	"Power off and disable privacy"},
@@ -2335,7 +2391,7 @@ static const struct bt_shell_menu main_menu = {
 
 int main(int argc, char *argv[])
 {
-	int status;
+	int status, i;
 
 	l_log_set_stderr();
 
@@ -2392,6 +2448,9 @@ int main(int argc, char *argv[])
 
 	l_io_destroy(conn_io);
 	l_queue_destroy(hcidevs, free_hcidev);
+
+	for (i = 0; i < num_peers; i++)
+		l_queue_destroy(peers[i].rpl, l_free);
 
 	return status;
 }
