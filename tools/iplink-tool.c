@@ -84,6 +84,7 @@ struct hcidev {
 struct net_key {
 	uint32_t id;
 	uint32_t seq;
+	uint8_t fid;
 	uint8_t n_key[16];
 	uint8_t enc_key[16];
 	uint8_t priv_key[16];
@@ -909,7 +910,7 @@ static struct ipl_node* clarify_header(bool *decrypted, struct net_key *key,
 	print_data("priv key", 0, key->priv_key, 16);
 	print_data("seed", 0, seed, 16);
 
-	len = IPLINK_SAZ(pdu->fctl) ? 7 : 13;
+	len = IPLINK_SAZ(pdu->fctl) ? 13 : 7;
 
 	fid = IPLINK_OP(pdu->fctl) || IPLINK_AR(pdu->fctl);
 	*hdr_sz += ((fid) ? len : len -1);
@@ -958,11 +959,11 @@ static bool decrypt_payload(uint8_t *out, struct ipl_pdu *pdu,
 	add_len = 2;
 
 	if(IPLINK_SAZ(pdu->fctl)) {
-		l_put_be16(local->node.addr_16, &add_data[add_len]);
-		add_len += 2;
-	} else {
 		l_put_be16(local->node.addr_64, &add_data[add_len]);
 		add_len += 8;
+	} else {
+		l_put_be16(local->node.addr_16, &add_data[add_len]);
+		add_len += 2;
 	}
 
 	add_data[add_len++] = pdu->fctl;
@@ -1027,11 +1028,11 @@ static bool obfuscate_header(uint8_t *out, struct net_key *key,
 	l_put_be32(pdu->seq, &hdr[1]);
 
 	if (IPLINK_SAZ(pdu->fctl)) {
+		l_put_be64(local->node.addr_64, &hdr[5]);
+		len = 13;
+	} else {
 		l_put_be16(local->node.addr_16, &hdr[5]);
 		len = 7;
-	} else {
-		len = 13;
-		l_put_be64(local->node.addr_64, &hdr[5]);
 	}
 
 	for (k = 0, i = fid ? 0 : 1; i < len; i++, k++)
@@ -1048,16 +1049,16 @@ static bool obfuscate_header(uint8_t *out, struct net_key *key,
 
 static bool generate_pdu(uint8_t *out, struct net_key *key,
 				struct ipl_node *peer, bool is_short,
-				struct ipl_pdu *pdu, uint32_t *total_len)
+				uint8_t fid, struct ipl_pdu *pdu,
+				uint32_t *total_len)
 {
-	uint16_t version = 0x0000;
 	uint32_t len, hdr_offset;
 	uint8_t *mic;
 
-	/* Visible header fields: version, FCTL, KEYID8 */
-	l_put_be16(version, out);
+	pdu->seq = key->seq;
 
-	len = 3;
+	/* Visible header fields: FCTL, [KEYID8], [FID] */
+	len = 1;
 	if (IPLINK_KIP(pdu->fctl)) {
 		out[len] = pdu->keyid;
 		len++;
@@ -1067,21 +1068,23 @@ static bool generate_pdu(uint8_t *out, struct net_key *key,
 
 	/* Calculate total header length */
 	/* FID */
-	if (IPLINK_OP(pdu->fctl) || IPLINK_AR(pdu->fctl))
+	if (IPLINK_OP(pdu->fctl) || IPLINK_AR(pdu->fctl)) {
 		len++;
+		pdu->fid = fid;
+	}
 
 	/* Sequence number */
 	len += 4;
 
 	if (is_addr64) {
-		pdu->fctl &= ~IPLINK_SAZ_FLAG;
+		pdu->fctl |= IPLINK_SAZ_FLAG;
 		len += 8;
 	} else {
-		pdu->fctl |= IPLINK_SAZ_FLAG;
+		pdu->fctl &= ~IPLINK_SAZ_FLAG;
 		len += 2;
 	}
 
-	out[2] = pdu->fctl;
+	out[0] = pdu->fctl;
 
 	/* Encrypt payload and generate MIC */
 	if (!encrypt_payload(out + len, pdu, key, peer, is_short))
@@ -1097,7 +1100,7 @@ static bool generate_pdu(uint8_t *out, struct net_key *key,
 	print_data("encrypted PDU", 0, out, *total_len);
 
 	/* Increment local sequence number */
-	pdu->seq = key->seq++;
+	key->seq++;
 
 	return true;
 }
@@ -1114,7 +1117,6 @@ static bool ack_reply(uint8_t fctl, struct net_key *key, uint8_t fid,
 
 	pdu.payload = NULL;
 	pdu.payload_len = 0;
-	pdu.fid = fid;
 
 	/* TODO: differentiate between L2CAP & AEXT connection */
 
@@ -1126,7 +1128,7 @@ static bool ack_reply(uint8_t fctl, struct net_key *key, uint8_t fid,
 
 	offset = 6;
 
-	if (!generate_pdu(send_buf + offset, key, peer, is_short, &pdu,
+	if (!generate_pdu(send_buf + offset, key, peer, is_short, fid, &pdu,
 								&total_len)) {
 		print("Failed to generate ACK response");
 		return false;
@@ -1186,10 +1188,9 @@ static void parse_pdu(uint8_t *buf, uint32_t len)
 
 	memset(&pdu, 0, sizeof (pdu));
 
-	print("Version %4.4x", l_get_be16(buf));
-	hdr_sz = 2;
+	hdr_sz = 1;
 
-	pdu.fctl = buf[hdr_sz++];
+	pdu.fctl = buf[0];
 	print("FCTL %2.2x", pdu.fctl);
 
 try_again:
@@ -1768,10 +1769,11 @@ static void cmd_send_data(int argc, char **argv)
 
 	offset = 6;
 
-	if (!generate_pdu(send_buf + offset, key, peer, is_short, &pdu,
-								&pdu_len))
+	if (!generate_pdu(send_buf + offset, key, peer, is_short, key->fid,
+								&pdu, &pdu_len))
 		return bt_shell_noninteractive_quit(EXIT_FAILURE);
 
+	key->fid = (key->fid < 0xff) ? key->fid + 1 : 0;
 	iov.iov_base = send_buf;
 	iov.iov_len = pdu_len + offset;
 
