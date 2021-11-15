@@ -887,9 +887,9 @@ static struct ipl_node* clarify_header(bool *decrypted, struct net_key *key,
 					struct ipl_pdu *pdu, uint8_t *buf,
 					uint8_t *mic, uint32_t *hdr_sz)
 {
-	uint8_t hdr[13] = {0};
+	uint8_t hdr[13];
 	uint8_t seed[16];
-	uint32_t len, i, k;
+	uint32_t len, i, fid_offset = 0;
 	uint16_t src16;
 	uint16_t src64;
 	bool fid;
@@ -910,13 +910,16 @@ static struct ipl_node* clarify_header(bool *decrypted, struct net_key *key,
 	print_data("priv key", 0, key->priv_key, 16);
 	print_data("seed", 0, seed, 16);
 
-	len = IPLINK_SAZ(pdu->fctl) ? 13 : 7;
+	len = IPLINK_SAZ(pdu->fctl) ? 12 : 6;
 
 	fid = IPLINK_OP(pdu->fctl) || IPLINK_AR(pdu->fctl);
-	*hdr_sz += ((fid) ? len : len -1);
+	if (fid)
+		len++;
 
-	for (i = 0, k = fid ? 0 : 1; k < len; i++, k++)
-		hdr[k] = seed[k] ^ buf[i];
+	for (i = 0; i < len; i++)
+		hdr[i] = seed[i] ^ buf[i];
+
+	*hdr_sz = len;
 
 	print_data("obfuscated", 0, buf, len);
 	print_data("cl header", 0, hdr, len);
@@ -924,18 +927,19 @@ static struct ipl_node* clarify_header(bool *decrypted, struct net_key *key,
 	if (fid) {
 		pdu->fid = hdr[0];
 		print("fid = %2.2x", pdu->fid);
+		fid_offset = 1;
 	}
 
-	pdu->seq = l_get_be32(&hdr[1]);
+	pdu->seq = l_get_be32(&hdr[fid_offset]);
 	print("Seq # = %u", pdu->seq);
 
-	if (len == 7) {
-		src16 = l_get_be16(&hdr[5]);
+	if (len < 12) {
+		src16 = l_get_be16(&hdr[4 + fid_offset]);
 		print("Src16 %4.4x", src16);
 		return match_peer_by_short_addr(src16);
 	}
 
-	src64 = l_get_be64(&hdr[5]);
+	src64 = l_get_be64(&hdr[4 + fid_offset]);
 	print("Src64 %8.8x", src64);
 
 	return match_peer_by_long_addr(src64);
@@ -1004,8 +1008,7 @@ static bool obfuscate_header(uint8_t *out, struct net_key *key,
 {
 	uint8_t hdr[13];
 	uint8_t seed[16];
-	uint32_t len, i, k;
-	bool fid = false;
+	uint32_t i, len = 0;
 
 	/* Privacy seed */
 	memset(seed, 0, 4);
@@ -1013,44 +1016,44 @@ static bool obfuscate_header(uint8_t *out, struct net_key *key,
 	memcpy(&seed[8], mic, 8);
 
 	print_data("mic", 0, mic, 8);
+	print_data("privacy seed", 0, seed, 16);
 
 	if (!aes_ecb_one(key->priv_key, seed, seed, 16))
 		return false;
 
 	print_data("priv key", 0, key->priv_key, 16);
-	print_data("seed", 0, seed, 16);
+	print_data("seed vector", 0, seed, 16);
 
 	/* Header fields */
-	fid = (IPLINK_OP(pdu->fctl) || IPLINK_AR(pdu->fctl));
-
-	hdr[0] = fid ? pdu->fid : 0;
-
-	l_put_be32(pdu->seq, &hdr[1]);
-
-	if (IPLINK_SAZ(pdu->fctl)) {
-		l_put_be64(local->node.addr_64, &hdr[5]);
-		len = 13;
-	} else {
-		l_put_be16(local->node.addr_16, &hdr[5]);
-		len = 7;
+	if ((IPLINK_OP(pdu->fctl) || IPLINK_AR(pdu->fctl))) {
+		hdr[0] = pdu->fid;
+		len++;
 	}
 
-	for (k = 0, i = fid ? 0 : 1; i < len; i++, k++)
-		out[k] = seed[i] ^ hdr[i];
+	l_put_be32(pdu->seq, &hdr[len]);
+	len += 4;
 
-	print_data("header", 0, hdr + (fid ? 0 : 1), len - (fid ? 0 : 1));
-	print_data("obfuscated", 0, out, len - (fid ? 0 : 1));
+	if (IPLINK_SAZ(pdu->fctl)) {
+		l_put_be64(local->node.addr_64, &hdr[len]);
+		len += 8;
+	} else {
+		l_put_be16(local->node.addr_16, &hdr[len]);
+		len += 2;
+	}
 
-	for (i = fid ? 0 : 1; i < len; i++)
-		hdr[i] = seed[i] ^ out[i];
+	for (i = 0; i < len; i++)
+		out[i] = seed[i] ^ hdr[i];
+
+	print_data("header", 0, hdr, len);
+	print_data("obfuscated", 0, out, len);
 
 	return true;
 }
 
 static bool generate_pdu(uint8_t *out, struct net_key *key,
-				struct ipl_node *peer, bool is_short,
-				uint8_t fid, struct ipl_pdu *pdu,
-				uint32_t *total_len)
+				struct ipl_node *peer, uint8_t fid,
+				bool is_short,
+				struct ipl_pdu *pdu, uint32_t *total_len)
 {
 	uint32_t len, hdr_offset;
 	uint8_t *mic;
@@ -1128,7 +1131,7 @@ static bool ack_reply(uint8_t fctl, struct net_key *key, uint8_t fid,
 
 	offset = 6;
 
-	if (!generate_pdu(send_buf + offset, key, peer, is_short, fid, &pdu,
+	if (!generate_pdu(send_buf + offset, key, peer, fid, is_short, &pdu,
 								&total_len)) {
 		print("Failed to generate ACK response");
 		return false;
@@ -1181,30 +1184,31 @@ static void parse_pdu(uint8_t *buf, uint32_t len)
 	struct ipl_pdu pdu;
 	struct ipl_node *peer;
 	struct net_key *key;
-	uint32_t hdr_sz;
+	uint32_t hdr_len, sz;
 	uint8_t *mic;
-	int i;
+	int i = 0;
 	bool res;
 
 	memset(&pdu, 0, sizeof (pdu));
 
-	hdr_sz = 1;
+	hdr_len = 1;
 
 	pdu.fctl = buf[0];
+
 	print("FCTL %2.2x", pdu.fctl);
 
 try_again:
 	if (IPLINK_KIP(pdu.fctl)) {
-		pdu.keyid = buf[hdr_sz++];
+		pdu.keyid = buf[hdr_len++];
 		i = find_key_by_keyid_8(pdu.keyid, i);
 
 		if (i < 0) {
-			print("Key does not exist");
+			print("Key %2.2x does not exist", pdu.keyid);
 			return;
 		}
 
-		print("Trying to use key %u", key->id);
 		key = &keys[i];
+		print("Trying to use key %u", key->id);
 	} else {
 		i = -1;
 
@@ -1220,7 +1224,7 @@ try_again:
 	mic = buf + len - 8;
 	print_data("mic", 0, mic, 8);
 
-	peer = clarify_header(&res, key, &pdu, buf + hdr_sz, mic, &hdr_sz);
+	peer = clarify_header(&res, key, &pdu, buf + hdr_len, mic, &sz);
 
 	if (!peer) {
 
@@ -1237,11 +1241,13 @@ try_again:
 		return;
 	}
 
+	hdr_len += sz;
+
 	if (pdu.seq && !check_rpl(peer, key->id, pdu.seq))
 		return;
 
-	pdu.payload = buf + hdr_sz;
-	pdu.payload_len = len - hdr_sz - 8;
+	pdu.payload = buf + hdr_len;
+	pdu.payload_len = len - hdr_len - 8;
 
 	if (!decrypt_payload(rx_buf, &pdu, key, peer))
 		return;
@@ -1697,7 +1703,7 @@ static void cmd_send_data(int argc, char **argv)
 	struct ipl_pdu pdu = {.fid = 0,};
 	struct net_key *key;
 	struct iovec iov;
-	uint32_t val, pdu_len, offset = 0;
+	uint32_t val, len, offset = 0;
 	bool is_short;
 	int next_arg;
 
@@ -1769,13 +1775,17 @@ static void cmd_send_data(int argc, char **argv)
 
 	offset = 6;
 
-	if (!generate_pdu(send_buf + offset, key, peer, is_short, key->fid,
-								&pdu, &pdu_len))
+	if (!generate_pdu(send_buf + offset, key, peer, key->fid, is_short,
+								&pdu, &len))
 		return bt_shell_noninteractive_quit(EXIT_FAILURE);
+
+	/* Increment FID */
+	if (IPLINK_OP(pdu.fctl) || IPLINK_AR(pdu.fctl))
+		key->fid++;
 
 	key->fid = (key->fid < 0xff) ? key->fid + 1 : 0;
 	iov.iov_base = send_buf;
-	iov.iov_len = pdu_len + offset;
+	iov.iov_len = len + offset;
 
 	send_data(&iov);
 
@@ -1941,7 +1951,7 @@ static void write2file(const void *buffer, size_t len, const char *path)
 
 	fd = L_TFR(mkostemp(tmp_path, O_CLOEXEC));
 	if (fd == -1) {
-		printf("Error creating temp file %s\n", tmp_path);
+		print("Error creating temp file %s\n", tmp_path);
 		goto done;
 	}
 
@@ -1949,13 +1959,13 @@ static void write2file(const void *buffer, size_t len, const char *path)
 	L_TFR(close(fd));
 
 	if (written != (ssize_t) len) {
-		printf("Error writing %lu bytes to temp file %s\n",
+		print("Error writing %lu bytes to temp file %s\n",
 							len, tmp_path);
 		goto done;
 	}
 
 	if (rename(tmp_path, path) == -1)
-		printf("Error renaming %s to %s", tmp_path, path);
+		print("Error renaming %s to %s", tmp_path, path);
 
 done:
 	l_free(tmp_path);
@@ -1969,11 +1979,11 @@ static void save_to_file(const char *path)
 	size_t length = 0;
 	int i, k;
 
-	printf("Saving updated info to %s\n", path);
+	print("Saving updated info to %s\n", path);
 
 	settings = l_settings_new();
 	if(!l_settings_load_from_file(settings, path)) {
-		printf("Failed to load configuration from %s\n", path);
+		print("Failed to load configuration from %s\n", path);
 		l_settings_free(settings);
 		goto done;
 	}
@@ -2052,7 +2062,7 @@ static bool setup_from_file(const char *path)
 		if (strncmp(groups[i], "Network", 7))
 			continue;
 
-		sscanf(groups[i] + 7, "%d", &keys[k + 1].id);
+		sscanf(groups[i] + 7, "%d", &keys[k].id);
 
 		buf = l_settings_get_bytes(settings, groups[i], "Key", &n);
 		if (!buf || n != 16) {
@@ -2414,7 +2424,7 @@ int main(int argc, char *argv[])
 
 	if (addr_type_option) {
 		if (strlen(addr_type_option) != 3) {
-			printf("Invalid address type: expected u64 or u16\n");
+			print("Invalid address type: expected u64 or u16\n");
 			exit(1);
 		}
 
@@ -2431,7 +2441,7 @@ int main(int argc, char *argv[])
 	if (mgmt_index != MGMT_INDEX_NONE) {
 		if (!mgmt_send(mgmt, MGMT_OP_READ_INFO, mgmt_index, 0, NULL,
 				info_rsp, UINT_TO_PTR(mgmt_index), NULL)) {
-			printf("Unable to send read_info cmd\n");
+			print("Unable to send read_info cmd\n");
 		}
 	}
 
