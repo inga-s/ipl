@@ -127,12 +127,12 @@ static bool is_addr64;
 static struct l_io *conn_io;
 static struct l_io *listen_io;
 
-static uint8_t short_frame[] = {0xde, 0xad, 0xbe, 0xef, 0x11, 0x22, 0x33, 0x44};
+static uint8_t short_frame[] = {0xab, 0xcd};
 static uint8_t send_buf[2048];
 static uint8_t rx_buf[2048];
 
-static const char *client_cfg_path = "/home/istotlan/.config/iplink/client.txt";
-static const char *server_cfg_path = "/home/istotlan/.config/iplink/server.txt";
+static const char *client_cfg_path = "/home/istotlan/.config/iplink/client.sample.txt";
+static const char *server_cfg_path = "/home/istotlan/.config/iplink/server.sample.txt";
 
 static struct local_state *local;
 static bool privacy = true;
@@ -148,13 +148,14 @@ static int pending_index = 0;
 static bool is_powered;
 
 static uint8_t address_key[16];
-static uint8_t prand[3] = {0x42, 0x34, 0x56};
+//static uint8_t prand[3] = {0x51, 0xf4, 0x2d};
+static uint8_t prand[3] = {0x2d, 0xf4, 0x51};
 
 static struct net_key keys[MAX_KEYS];
 static uint16_t num_keys;
 struct net_key *default_temp_key;
 
-static uint16_t nid = 0xabcd;
+static uint16_t nid = 0x1234;
 
 static uint16_t iplink_psm = 0x0080; //TODO: What is the correct value?
 static int sec_level = BT_SECURITY_LOW;
@@ -280,7 +281,7 @@ static bool generate_ark_long(uint64_t addr, uint8_t out[16])
 	if (!checksum)
 		return false;
 
-	buf[0] = 0x00;
+	buf[0] = 0x01;
 	len++;
 	memcpy(&buf[len], &nid, 2);
 	len += 2;
@@ -298,16 +299,20 @@ static bool generate_ark_short(uint16_t addr, uint8_t out[16])
 	void *checksum;
 	bool res;
 
+	print_data("Address key", 0, address_key, 16);
+
 	checksum = l_checksum_new_cmac_aes(address_key, 16);
 	if (!checksum)
 		return false;
 
-	buf[0] = 0x01;
+	buf[0] = 0x00;
+
 	len++;
 	memcpy(&buf[len], &nid, 2);
 	len += 2;
 	memcpy(&buf[3], &addr, 2);
 	len += 2;
+
 	res = aes_cmac(checksum, buf, len, out);
 	l_checksum_free(checksum);
 	return res;
@@ -330,7 +335,7 @@ static bool aes_ecb_one(uint8_t key[16], const uint8_t *in, uint8_t *out,
 	return result;
 }
 
-static void generate_irpa(uint8_t key[16], uint8_t prand[3], bdaddr_t irpa)
+static void generate_irpa(uint8_t key[16], uint8_t prand[3], bdaddr_t *irpa)
 {
 	uint8_t prand_pad[16];
 	uint8_t res[16];
@@ -339,10 +344,13 @@ static void generate_irpa(uint8_t key[16], uint8_t prand[3], bdaddr_t irpa)
 	memcpy(prand_pad + 13, prand, 3);
 	aes_ecb_one(key, prand_pad, res,16);
 
-	memcpy(&irpa.b[0], res + 13, 3);
-	memcpy(&irpa.b[3], prand, 3);
-	irpa.b[5] &=  0x3f;
-	irpa.b[5] |= 0x40;
+	memcpy(&irpa->b[0], res + 13, 3);
+	memcpy(&irpa->b[3], prand, 3);
+	irpa->b[5] &=  0x3f;
+	irpa->b[5] |= 0x40;
+
+	print_data("IRPA bytes", 0, irpa->b, 6);
+
 }
 
 static void network_nonce(uint32_t seq, uint64_t src, uint8_t nonce[13])
@@ -403,9 +411,11 @@ static bool encrypt_payload(uint8_t *out, struct ipl_pdu *pdu,
 	if (IPLINK_AR(pdu->fctl) || IPLINK_OP(pdu->fctl))
 		add_data[add_len++] = pdu->fid;
 
+	if (IPLINK_AR(pdu->fctl))
+		print("ACK required!");
 	print("encrypt:");
 	print_data("nonce", 0, nonce, 13);
-	print_data("key", 0, key, 16);
+	print_data("key", 0, key->n_key, 16);
 	print_data("add", 0, add_data, add_len);
 	print_data("data", 0, pdu->payload, pdu->payload_len);
 
@@ -1103,7 +1113,7 @@ static bool generate_pdu(uint8_t *out, struct net_key *key,
 	print_data("encrypted PDU", 0, out, *total_len);
 
 	/* Increment local sequence number */
-	key->seq++;
+	//key->seq++;
 
 	return true;
 }
@@ -1255,8 +1265,9 @@ try_again:
 	if (!IPLINK_AR(pdu.fctl))
 		return;
 
+	print("ACK reply fctl %2.2x", pdu.fctl);
 	ack_reply(IPLINK_KIP(pdu.fctl) != 0, key, pdu.fid, peer,
-					IPLINK_SAZ(pdu.fctl) != 0);
+					IPLINK_SAZ(pdu.fctl) == 0);
 }
 
 static bool read_cb(struct l_io *io, void *user_data)
@@ -2082,6 +2093,8 @@ static bool setup_from_file(const char *path)
 			keys[k].seq = 0;
 		}
 
+		keys[k].fid = 0x34;
+
 		k++;
 	}
 
@@ -2215,8 +2228,8 @@ static bool init_local_node(const char *path)
 		!generate_ark_short(local->node.addr_16, local->node.ark_short))
 		return false;
 
-	generate_irpa(local->node.ark_long, prand, local->node.irpa_long);
-	generate_irpa(local->node.ark_short, prand, local->node.irpa_short);
+	generate_irpa(local->node.ark_long, prand, &local->node.irpa_long);
+	generate_irpa(local->node.ark_short, prand, &local->node.irpa_short);
 
 	print_data("ARK long", 0, local->node.ark_long, 16);
 	ba2str(&local->node.irpa_long, buf);
@@ -2452,7 +2465,7 @@ int main(int argc, char *argv[])
 	mgmt_unref(mgmt);
 
 	if (local) {
-		save_to_file(local->is_server ?
+		if (0) save_to_file(local->is_server ?
 					server_cfg_path : client_cfg_path);
 		l_io_destroy(local->io);
 		l_free(local);
