@@ -277,6 +277,8 @@ static bool generate_ark_long(uint64_t addr, uint8_t out[16])
 	void *checksum;
 	bool res;
 
+	print_data("Address key", 0, address_key, 16);
+		
 	checksum = l_checksum_new_cmac_aes(address_key, 16);
 	if (!checksum)
 		return false;
@@ -288,6 +290,7 @@ static bool generate_ark_long(uint64_t addr, uint8_t out[16])
 	memcpy(&buf[3], &addr, 8);
 	len += 8;
 	res = aes_cmac(checksum, buf, len, out);
+
 	l_checksum_free(checksum);
 	return res;
 }
@@ -298,20 +301,29 @@ static bool generate_ark_short(uint16_t addr, uint8_t out[16])
 	size_t len = 0;
 	void *checksum;
 	bool res;
-
+	
+	
 	print_data("Address key", 0, address_key, 16);
 
 	checksum = l_checksum_new_cmac_aes(address_key, 16);
 	if (!checksum)
 		return false;
-
-	buf[0] = 0x00;
-
-	len++;
-	memcpy(&buf[len], &nid, 2);
+#if 0
+	memcpy(&buf[0], &nid, 2);
 	len += 2;
 	memcpy(&buf[3], &addr, 2);
 	len += 2;
+	buf[len] = 0x00;
+
+	len++;
+#else
+	buf[1] = 0x34;
+	buf[2] = 0x12;
+	buf[3] = 0x01;
+	buf[3] = 0x00;
+	buf[0] = 0x00;
+	len = 5;
+#endif
 
 	res = aes_cmac(checksum, buf, len, out);
 	l_checksum_free(checksum);
@@ -338,16 +350,19 @@ static bool aes_ecb_one(uint8_t key[16], const uint8_t *in, uint8_t *out,
 static void generate_irpa(uint8_t key[16], uint8_t prand[3], bdaddr_t *irpa)
 {
 	uint8_t prand_pad[16];
-	uint8_t res[16];
+	static uint32_t prand_int = 0x2df451;
+	uint8_t res[16], *prand_p;
 
 	memset(prand_pad, 0, 13);
-	memcpy(prand_pad + 13, prand, 3);
-	aes_ecb_one(key, prand_pad, res,16);
+	prand_p = (uint8_t *) (&prand_int);
+	memcpy(prand_pad + 13, &prand_p[0], 3);
+	print_data("prand bytes", 0, prand_p, 4);
+	aes_ecb_one(key, prand_pad, res, 16);
 
-	memcpy(&irpa->b[0], res + 13, 3);
-	memcpy(&irpa->b[3], prand, 3);
-	irpa->b[5] &=  0x3f;
-	irpa->b[5] |= 0x40;
+	memcpy(&irpa->b[3], res + 13, 3);
+	memcpy(&irpa->b[0], &prand_p[0], 3);
+	irpa->b[2] &=  0x3f;
+	irpa->b[2] |= 0x40;
 
 	print_data("IRPA bytes", 0, irpa->b, 6);
 
